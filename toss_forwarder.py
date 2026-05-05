@@ -90,7 +90,7 @@ def _is_duplicate(text: str) -> tuple[bool, str, str]:
 # ─────────────────────────────────────────────
 # 3. Filter — only toss messages pass through
 # ─────────────────────────────────────────────
-_TOSS_PHRASE = re.compile(r"WON\s+THE\s+TOSS\s+AND\s+DECIDED\s+TO", re.IGNORECASE)
+_TOSS_PHRASE = re.compile(r"WON\s+THE\s+TOSS\s+AND\s+(DECIDED|CHOSE|OPTED|ELECTED)\s+TO", re.IGNORECASE)
 _DECISION    = re.compile(r"\b(BAT|BOWL)\b", re.IGNORECASE)
 _ENDING      = re.compile(r"[✔✅✓☑]")
 
