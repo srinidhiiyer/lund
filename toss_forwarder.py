@@ -2,7 +2,6 @@ import asyncio
 import logging
 import re
 import hashlib
-import random
 from datetime import datetime
 from pathlib import Path
 
@@ -18,9 +17,14 @@ load_dotenv()
 API_ID       = int(os.getenv("API_ID", "0"))
 API_HASH     = os.getenv("API_HASH", "")
 PHONE        = os.getenv("PHONE", "")
-SOURCE_CHAN  = os.getenv("SOURCE_CHANNEL", "")
 TARGET_CHAN  = os.getenv("TARGET_CHANNEL", "")
 SESSION_NAME = os.getenv("SESSION_NAME", "toss_session")
+
+# Comma-separated list of source channels in .env:
+#   SOURCE_CHANNELS=@chan1,@chan2,@chan3,@chan4,@chan5
+# Falls back to SOURCE_CHANNEL for backward compatibility.
+_raw_sources = os.getenv("SOURCE_CHANNELS", os.getenv("SOURCE_CHANNEL", ""))
+SOURCE_CHANS: list[str] = [s.strip() for s in _raw_sources.split(",") if s.strip()]
 
 # ─────────────────────────────────────────────
 # 1. Logging setup
@@ -39,41 +43,61 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
-# 2. Duplicate prevention
+# 2. Duplicate prevention (two layers)
+#    a) Exact hash  — byte-for-byte duplicates
+#    b) Fuzzy hash  — same content with minor emoji/spacing differences
 # ─────────────────────────────────────────────
-_seen_hashes: set[str] = set()
+_seen_exact: set[str] = set()
+_seen_fuzzy: set[str] = set()
+_dedup_lock = asyncio.Lock()   # prevents race when 2 sources fire at once
+
 SEEN_CACHE_FILE = Path("seen_hashes.txt")
 
-def _load_seen_cache():
+def _load_seen_cache() -> None:
     if SEEN_CACHE_FILE.exists():
         with open(SEEN_CACHE_FILE, encoding="utf-8") as f:
             for line in f:
-                _seen_hashes.add(line.strip())
-        log.info("Loaded %d seen hashes.", len(_seen_hashes))
+                parts = line.strip().split(":", 1)
+                if len(parts) == 2:
+                    kind, h = parts
+                    (_seen_exact if kind == "e" else _seen_fuzzy).add(h)
+                else:
+                    _seen_exact.add(parts[0])   # legacy format
+        log.info("Loaded %d exact + %d fuzzy hashes.", len(_seen_exact), len(_seen_fuzzy))
 
-def _save_hash(h: str):
-    _seen_hashes.add(h)
+def _persist_hashes(exact: str, fuzzy: str) -> None:
+    _seen_exact.add(exact)
+    _seen_fuzzy.add(fuzzy)
     with open(SEEN_CACHE_FILE, "a", encoding="utf-8") as f:
-        f.write(h + "\n")
+        f.write(f"e:{exact}\n")
+        f.write(f"f:{fuzzy}\n")
 
-def _message_hash(text: str) -> str:
+def _exact_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
+def _fuzzy_hash(text: str) -> str:
+    """Strips emoji/punctuation/case so near-identical messages collide."""
+    t = text.lower()
+    t = re.sub(r"[^\w\s]", " ", t, flags=re.UNICODE)   # keep only word chars
+    t = " ".join(t.split())                              # collapse whitespace
+    return hashlib.sha256(t.encode("utf-8")).hexdigest()
+
+def _is_duplicate(text: str) -> tuple[bool, str, str]:
+    eh = _exact_hash(text)
+    fh = _fuzzy_hash(text)
+    return (eh in _seen_exact or fh in _seen_fuzzy), eh, fh
+
 # ─────────────────────────────────────────────
-# 3. Filter patterns (FIXED)
+# 3. Filter — only toss messages pass through
 # ─────────────────────────────────────────────
 _TOSS_PHRASE = re.compile(r"WON\s+THE\s+TOSS\s+AND\s+DECIDED\s+TO", re.IGNORECASE)
-_DECISION = re.compile(r"\b(BAT|BOWL)\b", re.IGNORECASE)
-
-# 🔥 FIX: allow ticks anywhere (not just end)
-_ENDING = re.compile(r"[✔✅✓☑]")
+_DECISION    = re.compile(r"\b(BAT|BOWL)\b", re.IGNORECASE)
+_ENDING      = re.compile(r"[✔✅✓☑]")
 
 def is_toss_message(text: str) -> bool:
     if not text:
         return False
-
     normalised = " ".join(text.split())
-
     return bool(
         _TOSS_PHRASE.search(normalised)
         and _DECISION.search(normalised)
@@ -81,93 +105,74 @@ def is_toss_message(text: str) -> bool:
     )
 
 # ─────────────────────────────────────────────
-# 4. Emoji styling (MODIFIED ONLY HERE)
-# ─────────────────────────────────────────────
-def format_message(text: str) -> str:
-    text_clean = text.strip()
-
-    # Remove all * (fix broken formatting)
-    text_clean = text_clean.replace("*", "")
-
-    # Random replacement for DECIDED
-    choices = ["OPT", "WANT", "PICKED", "ELECT", "CHOOSE"]
-    replacement = random.choice(choices)
-    text_clean = re.sub(r"\bDECIDED\b", replacement, text_clean, flags=re.IGNORECASE)
-
-    # Add FIRST after BAT or BOWL if missing
-    text_clean = re.sub(r"\bBAT\b(?!\s+FIRST)", "BAT FIRST", text_clean, flags=re.IGNORECASE)
-    text_clean = re.sub(r"\bBOWL\b(?!\s+FIRST)", "BOWL FIRST", text_clean, flags=re.IGNORECASE)
-
-    # Replace ending ticks with ✅✅
-    text_clean = re.sub(r"(✔️|✔|✓|☑|✅)+\s*$", "✅✅", text_clean)
-
-    # Clean spacing
-    text_clean = " ".join(text_clean.split())
-
-    # 5. Make text BOLD
-    return f"<b>{text_clean}</b>"
-
-# ─────────────────────────────────────────────
-# 5. Client
+# 4. Client + event handler
 # ─────────────────────────────────────────────
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
-@client.on(events.NewMessage(chats=SOURCE_CHAN))
-async def handle_new_message(event):
+@client.on(events.NewMessage(chats=SOURCE_CHANS))
+async def handle_new_message(event: events.NewMessage.Event) -> None:
     message = event.message
-    text = message.text or ""
+    text    = message.text or ""
+    source  = getattr(event.chat, "username", None) or str(event.chat_id)
 
-    log.debug("Received: %s", text)
+    log.debug("[%s] Received: %s", source, text[:80])
 
-    # Filter
+    # ── Filter ────────────────────────────────
     if not is_toss_message(text):
         return
 
-    # Duplicate check
-    h = _message_hash(text)
-    if h in _seen_hashes:
-        log.info("Duplicate skipped.")
-        return
+    # ── Dedup (locked so concurrent sources can't both slip through) ──
+    async with _dedup_lock:
+        is_dup, eh, fh = _is_duplicate(text)
+        if is_dup:
+            log.info("[%s] Duplicate skipped.", source)
+            return
+        # Claim the hashes before releasing the lock
+        _persist_hashes(eh, fh)
 
+    # ── Send raw text — no formatting changes, no "Forwarded from" ──
     try:
-        new_msg = format_message(text)
-
-        # ✅ Copy-paste (not forward)
-        await client.send_message(entity=TARGET_CHAN, message=new_msg, parse_mode="html")
-
-        _save_hash(h)
-
-        log.info(
-            "✅ Sent at %s | %s",
-            datetime.utcnow().isoformat(timespec="seconds"),
-            new_msg,
+        # Re-send with the original Telegram formatting entities (bold/italic/etc.)
+        # so the message looks exactly the same as the source, just without
+        # any "Forwarded from" header.
+        await client.send_message(
+            entity=TARGET_CHAN,
+            message=text,
+            formatting_entities=message.entities,  # preserves original bold/italic/etc.
         )
 
-    except Exception as e:
-        log.error("❌ Error: %s", e)
+        log.info(
+            "✅ [%s] Sent at %s",
+            source,
+            datetime.utcnow().isoformat(timespec="seconds"),
+        )
+
+    except Exception as exc:
+        log.error("❌ [%s] Send error: %s", source, exc)
 
 # ─────────────────────────────────────────────
-# 6. Main
+# 5. Main
 # ─────────────────────────────────────────────
-async def main():
-    if not all([API_ID, API_HASH, PHONE, SOURCE_CHAN, TARGET_CHAN]):
-        log.critical("Missing config in .env")
+async def main() -> None:
+    if not all([API_ID, API_HASH, PHONE, SOURCE_CHANS, TARGET_CHAN]):
+        log.critical(
+            "Missing config. Need API_ID, API_HASH, PHONE, "
+            "SOURCE_CHANNELS (or SOURCE_CHANNEL), TARGET_CHANNEL in .env"
+        )
         return
 
     _load_seen_cache()
 
-    log.info("🚀 Starting...")
-    log.info("Source: %s", SOURCE_CHAN)
-    log.info("Target: %s", TARGET_CHAN)
+    log.info("🚀 Starting…")
+    log.info("Sources (%d): %s", len(SOURCE_CHANS), ", ".join(SOURCE_CHANS))
+    log.info("Target : %s", TARGET_CHAN)
 
     await client.start(phone=PHONE)
+    await client.get_dialogs()   # ensures all channels are cached
 
-    # 🔥 FIX: load dialogs (important for Railway)
-    await client.get_dialogs()
-
-    log.info("✅ Logged in. Listening...")
-
+    log.info("✅ Logged in. Listening on %d source(s)…", len(SOURCE_CHANS))
     await client.run_until_disconnected()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
