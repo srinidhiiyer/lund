@@ -122,13 +122,19 @@ async def handle_new_message(event: events.NewMessage.Event) -> None:
     if not is_toss_message(text):
         return
 
-    # ── Dedup (locked so concurrent sources can't both slip through) ──
+# ── Dedup — fast pre-check without lock, then confirm under lock ──
+    eh = _exact_hash(text)
+    fh = _fuzzy_hash(text)
+
+    if eh in _seen_exact or fh in _seen_fuzzy:
+        log.info("[%s] Duplicate skipped.", source)
+        return
+
     async with _dedup_lock:
-        is_dup, eh, fh = _is_duplicate(text)
-        if is_dup:
-            log.info("[%s] Duplicate skipped.", source)
+        # Re-check inside lock in case another source just claimed it
+        if eh in _seen_exact or fh in _seen_fuzzy:
+            log.info("[%s] Duplicate skipped (race).", source)
             return
-        # Claim the hashes before releasing the lock
         _persist_hashes(eh, fh)
 
     # ── Send raw text — no formatting changes, no "Forwarded from" ──
