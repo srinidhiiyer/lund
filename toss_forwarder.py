@@ -113,6 +113,7 @@ client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 async def handle_new_message(event: events.NewMessage.Event) -> None:
     message = event.message
     text    = message.text or ""
+    text    = text.replace("*", "") 
     source  = getattr(event.chat, "username", None) or str(event.chat_id)
 
     log.debug("[%s] Received: %s", source, text[:80])
