@@ -22,7 +22,6 @@ SESSION_NAME = os.getenv("SESSION_NAME", "toss_session")
 
 # Comma-separated list of source channels in .env:
 #   SOURCE_CHANNELS=@chan1,@chan2,@chan3,@chan4,@chan5
-# Falls back to SOURCE_CHANNEL for backward compatibility.
 _raw_sources = os.getenv("SOURCE_CHANNELS", os.getenv("SOURCE_CHANNEL", ""))
 SOURCE_CHANS: list[str] = [s.strip() for s in _raw_sources.split(",") if s.strip()]
 
@@ -43,13 +42,11 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
-# 2. Duplicate prevention (two layers)
-#    a) Exact hash  — byte-for-byte duplicates
-#    b) Fuzzy hash  — same content with minor emoji/spacing differences
+# 2. Duplicate prevention
 # ─────────────────────────────────────────────
 _seen_exact: set[str] = set()
 _seen_fuzzy: set[str] = set()
-_dedup_lock = asyncio.Lock()   # prevents race when 2 sources fire at once
+_dedup_lock = asyncio.Lock()
 
 SEEN_CACHE_FILE = Path("seen_hashes.txt")
 
@@ -62,7 +59,7 @@ def _load_seen_cache() -> None:
                     kind, h = parts
                     (_seen_exact if kind == "e" else _seen_fuzzy).add(h)
                 else:
-                    _seen_exact.add(parts[0])   # legacy format
+                    _seen_exact.add(parts[0])
         log.info("Loaded %d exact + %d fuzzy hashes.", len(_seen_exact), len(_seen_fuzzy))
 
 def _persist_hashes(exact: str, fuzzy: str) -> None:
@@ -76,19 +73,13 @@ def _exact_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 def _fuzzy_hash(text: str) -> str:
-    """Strips emoji/punctuation/case so near-identical messages collide."""
     t = text.lower()
-    t = re.sub(r"[^\w\s]", " ", t, flags=re.UNICODE)   # keep only word chars
-    t = " ".join(t.split())                              # collapse whitespace
+    t = re.sub(r"[^\w\s]", " ", t, flags=re.UNICODE)
+    t = " ".join(t.split())
     return hashlib.sha256(t.encode("utf-8")).hexdigest()
 
-def _is_duplicate(text: str) -> tuple[bool, str, str]:
-    eh = _exact_hash(text)
-    fh = _fuzzy_hash(text)
-    return (eh in _seen_exact or fh in _seen_fuzzy), eh, fh
-
 # ─────────────────────────────────────────────
-# 3. Filter — only toss messages pass through
+# 3. Filter
 # ─────────────────────────────────────────────
 _TOSS_PHRASE = re.compile(r"WON\s+THE\s+TOSS\s+AND\s+(DECIDED|CHOSE|OPTED|ELECTED)\s+TO", re.IGNORECASE)
 _DECISION    = re.compile(r"\b(BAT|BOWL)\b", re.IGNORECASE)
@@ -105,24 +96,19 @@ def is_toss_message(text: str) -> bool:
     )
 
 # ─────────────────────────────────────────────
-# 4. Client + event handler
+# 4. Handler (registered dynamically in main)
 # ─────────────────────────────────────────────
-client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
-
-@client.on(events.NewMessage(chats=SOURCE_CHANS))
 async def handle_new_message(event: events.NewMessage.Event) -> None:
     message = event.message
-    text    = message.text or ""
-    text    = text.replace("*", "") 
+    text    = (message.text or "").replace("*", "")
     source  = getattr(event.chat, "username", None) or str(event.chat_id)
 
     log.debug("[%s] Received: %s", source, text[:80])
 
-    # ── Filter ────────────────────────────────
     if not is_toss_message(text):
         return
 
-# ── Dedup — fast pre-check without lock, then confirm under lock ──
+    # Fast pre-check without lock
     eh = _exact_hash(text)
     fh = _fuzzy_hash(text)
 
@@ -130,42 +116,35 @@ async def handle_new_message(event: events.NewMessage.Event) -> None:
         log.info("[%s] Duplicate skipped.", source)
         return
 
+    # Confirm + claim under lock
     async with _dedup_lock:
-        # Re-check inside lock in case another source just claimed it
         if eh in _seen_exact or fh in _seen_fuzzy:
             log.info("[%s] Duplicate skipped (race).", source)
             return
         _persist_hashes(eh, fh)
 
-    # ── Send raw text — no formatting changes, no "Forwarded from" ──
     try:
-        # Re-send with the original Telegram formatting entities (bold/italic/etc.)
-        # so the message looks exactly the same as the source, just without
-        # any "Forwarded from" header.
         await client.send_message(
             entity=TARGET_CHAN,
             message=text,
-            formatting_entities=message.entities,  # preserves original bold/italic/etc.
+            formatting_entities=message.entities,
         )
-
-        log.info(
-            "✅ [%s] Sent at %s",
-            source,
-            datetime.utcnow().isoformat(timespec="seconds"),
-        )
+        log.info("✅ [%s] Sent at %s", source, datetime.utcnow().isoformat(timespec="seconds"))
 
     except Exception as exc:
         log.error("❌ [%s] Send error: %s", source, exc)
 
 # ─────────────────────────────────────────────
-# 5. Main
+# 5. Client
+# ─────────────────────────────────────────────
+client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+
+# ─────────────────────────────────────────────
+# 6. Main
 # ─────────────────────────────────────────────
 async def main() -> None:
     if not all([API_ID, API_HASH, PHONE, SOURCE_CHANS, TARGET_CHAN]):
-        log.critical(
-            "Missing config. Need API_ID, API_HASH, PHONE, "
-            "SOURCE_CHANNELS (or SOURCE_CHANNEL), TARGET_CHANNEL in .env"
-        )
+        log.critical("Missing config in .env")
         return
 
     _load_seen_cache()
@@ -175,9 +154,30 @@ async def main() -> None:
     log.info("Target : %s", TARGET_CHAN)
 
     await client.start(phone=PHONE)
-    await client.get_dialogs()   # ensures all channels are cached
+    await client.get_dialogs()
 
-    log.info("✅ Logged in. Listening on %d source(s)…", len(SOURCE_CHANS))
+    # Resolve every source channel explicitly so Telethon
+    # actively listens to ALL of them, not just the first
+    resolved = []
+    for ch in SOURCE_CHANS:
+        try:
+            entity = await client.get_entity(ch)
+            resolved.append(entity)
+            log.info("✅ Listening to: %s", ch)
+        except Exception as e:
+            log.error("❌ Could not resolve %s: %s", ch, e)
+
+    if not resolved:
+        log.critical("No source channels resolved. Check your SOURCE_CHANNELS in .env")
+        return
+
+    # Register handler AFTER login with fully resolved entities
+    client.add_event_handler(
+        handle_new_message,
+        events.NewMessage(chats=resolved)
+    )
+
+    log.info("🟢 Watching %d source(s). Whichever posts first wins.", len(resolved))
     await client.run_until_disconnected()
 
 
