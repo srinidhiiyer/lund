@@ -14,28 +14,20 @@ import os
 # ─────────────────────────────────────────────
 load_dotenv()
 
-API_ID       = int(os.getenv("API_ID", "0"))
-API_HASH     = os.getenv("API_HASH", "")
-PHONE        = os.getenv("PHONE", "")
-TARGET_CHAN  = os.getenv("TARGET_CHANNEL", "")
-SESSION_NAME = os.getenv("SESSION_NAME", "toss_session")
-
-# The source you want to prioritise if multiple arrive at the same time
-# Set this in .env as: PRIORITY_SOURCE=kingtossline111
+API_ID          = int(os.getenv("API_ID", "0"))
+API_HASH        = os.getenv("API_HASH", "")
+PHONE           = os.getenv("PHONE", "")
+TARGET_CHAN     = os.getenv("TARGET_CHANNEL", "")
+SESSION_NAME    = os.getenv("SESSION_NAME", "toss_session")
 PRIORITY_SOURCE = os.getenv("PRIORITY_SOURCE", "").lower().strip("@")
 
-# Comma-separated source channels in .env:
-#   SOURCE_CHANNELS=@chan1,@chan2,@chan3,@chan4,@chan5
 _raw_sources = os.getenv("SOURCE_CHANNELS", os.getenv("SOURCE_CHANNEL", ""))
 SOURCE_CHANS: list[str] = [s.strip() for s in _raw_sources.split(",") if s.strip()]
 
-# Max characters allowed for a valid single-line toss message
-# Example valid msg: "🇦🇫 DUBAI ROYAL 🇦🇫 WON THE TOSS AND DECIDED TO BOWL ✔️✔️" (~60 chars)
-# Bulk/promo messages are much longer and will be blocked
 MAX_MSG_LEN = 100
 
 # ─────────────────────────────────────────────
-# 1. Logging setup
+# 1. Logging
 # ─────────────────────────────────────────────
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
@@ -53,9 +45,8 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────────
 # 2. Duplicate prevention
 # ─────────────────────────────────────────────
-_seen_exact: set[str] = set()
-_seen_fuzzy: set[str] = set()
-_dedup_lock  = asyncio.Lock()
+_seen_keys: set[str] = set()
+_seen_lock  = asyncio.Lock()
 
 SEEN_CACHE_FILE = Path("seen_hashes.txt")
 
@@ -63,38 +54,69 @@ def _load_seen_cache() -> None:
     if SEEN_CACHE_FILE.exists():
         with open(SEEN_CACHE_FILE, encoding="utf-8") as f:
             for line in f:
-                parts = line.strip().split(":", 1)
-                if len(parts) == 2:
-                    kind, h = parts
-                    (_seen_exact if kind == "e" else _seen_fuzzy).add(h)
-                else:
-                    _seen_exact.add(parts[0])   # legacy format
-        log.info("Loaded %d exact + %d fuzzy hashes.", len(_seen_exact), len(_seen_fuzzy))
+                h = line.strip()
+                if h:
+                    _seen_keys.add(h)
+        log.info("Loaded %d toss keys from cache.", len(_seen_keys))
 
-def _persist_hashes(exact: str, fuzzy: str) -> None:
-    _seen_exact.add(exact)
-    _seen_fuzzy.add(fuzzy)
+def _persist_key(key: str) -> None:
+    _seen_keys.add(key)
     with open(SEEN_CACHE_FILE, "a", encoding="utf-8") as f:
-        f.write(f"e:{exact}\n")
-        f.write(f"f:{fuzzy}\n")
+        f.write(key + "\n")
 
-def _exact_hash(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+def _toss_key(text: str) -> str | None:
+    """
+    Extract a dedup key using ONLY team name + bat/bowl decision.
+    Strips all emoji, flags, punctuation so that:
+      '🇦🇫 SPEEN GHAR 🇦🇫 WON THE TOSS AND DECIDED TO BAT ✔️'
+      '🏏 SPEEN GHAR 🏏 WON THE TOSS AND OPTED TO BAT FIRST ✓✓'
+    Both produce the same key: 'speenghar|bat'
+    """
+    clean = text.encode("ascii", "ignore").decode("ascii")
+    clean = clean.lower()
+    clean = re.sub(r"[^a-z0-9\s]", " ", clean)
+    clean = " ".join(clean.split())
 
-def _fuzzy_hash(text: str) -> str:
-    """
-    Strip all emoji and non-ASCII first, then remove punctuation.
-    So '🇦🇫 SPEEN GHAR 🇦🇫 WON THE TOSS... BAT' and
-       'SPEEN GHAR WON THE TOSS... BAT' produce the same hash.
-    """
-    t = text.lower()
-    t = t.encode("ascii", "ignore").decode("ascii")   # drop all emoji/unicode
-    t = re.sub(r"[^a-z0-9\s]", " ", t)               # keep only alphanum
-    t = " ".join(t.split())                            # collapse spaces
-    return hashlib.sha256(t.encode("utf-8")).hexdigest()
+    match = re.search(r"^(.*?)\s+won\s+the\s+toss", clean)
+    if not match:
+        return None
+    team = re.sub(r"\s+", "", match.group(1))
+
+    decision_match = re.search(r"\b(bat|bowl)\b", clean)
+    if not decision_match:
+        return None
+    decision = decision_match.group(1)
+
+    return f"{team}|{decision}"
 
 # ─────────────────────────────────────────────
-# 3. Filter
+# 3. Output formatter
+# ─────────────────────────────────────────────
+def _format_output(original_text: str) -> str:
+    """
+    Always outputs:
+      "🇹🇼 FIRE DRAGONS 🇹🇼" WON THE TOSS AND DECIDED TO BAT ✔️✔️
+
+    - Team name extracted from source (with original emoji/flags)
+    - Decision extracted from source (BAT or BOWL)
+    - Everything else is fixed format — DECIDED TO, ✔️✔️
+    """
+    # Extract team name (everything before WON THE TOSS) from original
+    team_match = re.search(r"^(.*?)\s+WON\s+THE\s+TOSS", original_text, re.IGNORECASE)
+    if not team_match:
+        return original_text  # fallback
+    team_part = team_match.group(1).strip()
+
+    # Extract decision (BAT or BOWL)
+    decision_match = re.search(r"\b(BAT|BOWL)\b", original_text, re.IGNORECASE)
+    if not decision_match:
+        return original_text  # fallback
+    decision = decision_match.group(1).upper()
+
+    return f'"{team_part}" WON THE TOSS AND DECIDED TO {decision} ✔️✔️'
+
+# ─────────────────────────────────────────────
+# 4. Filter
 # ─────────────────────────────────────────────
 _TOSS_PHRASE = re.compile(
     r"WON\s+THE\s+TOSS\s+AND\s+(DECIDED|CHOSE|OPTED?|ELECTED|CALLED)\s+TO",
@@ -107,16 +129,16 @@ def is_toss_message(text: str) -> bool:
     if not text:
         return False
 
-    # Block long messages — bulk summaries, promos, spam
+    # Block long messages (bulk summaries / promos)
     if len(text.strip()) > MAX_MSG_LEN:
-        log.debug("Blocked long message (%d chars)", len(text.strip()))
+        log.debug("Blocked: too long (%d chars)", len(text.strip()))
         return False
 
     normalised = " ".join(text.split())
 
-    # Block if more than one toss result in the message
+    # Block if more than one toss result
     if len(_TOSS_PHRASE.findall(normalised)) > 1:
-        log.debug("Blocked multi-toss message.")
+        log.debug("Blocked: multiple toss results.")
         return False
 
     has_phrase   = bool(_TOSS_PHRASE.search(normalised))
@@ -127,20 +149,20 @@ def is_toss_message(text: str) -> bool:
     return has_phrase and has_decision and (has_tick or has_first)
 
 # ─────────────────────────────────────────────
-# 4. Priority queue
-#    Each toss is held for 2 seconds.
-#    If PRIORITY_SOURCE arrives in that window → it wins.
-#    Otherwise the first source that arrived wins.
+# 5. Priority queue
+#    Hold each toss for 2s.
+#    If PRIORITY_SOURCE arrives in window → it wins.
+#    Otherwise first-arrived wins.
+#    Only ONE message ever sent per toss.
 # ─────────────────────────────────────────────
 _pending: dict = {}
 _pending_lock = asyncio.Lock()
 
-async def _flush_pending(fh: str) -> None:
-    """Wait 2s then send the best available source for this toss."""
+async def _flush_pending(toss_key: str) -> None:
     await asyncio.sleep(2)
 
     async with _pending_lock:
-        entry = _pending.pop(fh, None)
+        entry = _pending.pop(toss_key, None)
 
     if not entry:
         return
@@ -149,28 +171,27 @@ async def _flush_pending(fh: str) -> None:
     if not chosen:
         return
 
-    text, entities, source = chosen
+    original_text, source = chosen
+
+    # Always format into clean fixed output
+    formatted = _format_output(original_text)
+
     try:
         await client.send_message(
             entity=TARGET_CHAN,
-            message=text,
-            formatting_entities=entities,
+            message=formatted,
         )
-        log.info(
-            "✅ [%s] Sent at %s",
-            source,
-            datetime.utcnow().isoformat(timespec="seconds"),
-        )
+        log.info("✅ [%s] Sent: %s", source, formatted)
     except Exception as exc:
         log.error("❌ [%s] Send error: %s", source, exc)
 
 # ─────────────────────────────────────────────
-# 5. Client
+# 6. Client
 # ─────────────────────────────────────────────
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
 # ─────────────────────────────────────────────
-# 6. Handler
+# 7. Handler
 # ─────────────────────────────────────────────
 async def handle_new_message(event: events.NewMessage.Event) -> None:
     message = event.message
@@ -182,39 +203,40 @@ async def handle_new_message(event: events.NewMessage.Event) -> None:
     if not is_toss_message(text):
         return
 
-    eh = _exact_hash(text)
-    fh = _fuzzy_hash(text)
+    toss_key = _toss_key(text)
+    if not toss_key:
+        log.debug("[%s] Could not extract toss key, skipping.", source)
+        return
+
+    log.debug("[%s] Toss key: %s", source, toss_key)
 
     async with _pending_lock:
-        # Already seen → skip
-        if eh in _seen_exact or fh in _seen_fuzzy:
-            log.info("[%s] Duplicate skipped.", source)
+        # Already seen this toss (team + decision) → skip
+        if toss_key in _seen_keys:
+            log.info("[%s] Duplicate skipped (key: %s).", source, toss_key)
             return
-
-        # Claim hashes immediately so other sources are blocked
-        _persist_hashes(eh, fh)
 
         is_priority = bool(PRIORITY_SOURCE and PRIORITY_SOURCE in source)
 
-        if fh not in _pending:
-            # First arrival for this toss
-            _pending[fh] = {
-                "first":    (text, message.entities, source),
-                "priority": (text, message.entities, source) if is_priority else None,
+        if toss_key not in _pending:
+            # First arrival — claim key and start 2s window
+            _persist_key(toss_key)
+            _pending[toss_key] = {
+                "first":    (text, source),
+                "priority": (text, source) if is_priority else None,
             }
-            # Start 2s window
-            asyncio.create_task(_flush_pending(fh))
-            log.info("[%s] Queued. Waiting 2s for priority source…", source)
+            asyncio.create_task(_flush_pending(toss_key))
+            log.info("[%s] Queued '%s'. Waiting 2s for priority source…", source, toss_key)
         else:
-            # Another source arrived within the 2s window
-            if is_priority and not _pending[fh].get("priority"):
-                _pending[fh]["priority"] = (text, message.entities, source)
-                log.info("[%s] Priority source arrived — will use this.", source)
+            # Arrived within the 2s window
+            if is_priority and not _pending[toss_key].get("priority"):
+                _pending[toss_key]["priority"] = (text, source)
+                log.info("[%s] Priority source arrived for '%s'.", source, toss_key)
             else:
-                log.info("[%s] Secondary source — ignored.", source)
+                log.info("[%s] Secondary source for '%s' — ignored.", source, toss_key)
 
 # ─────────────────────────────────────────────
-# 7. Main
+# 8. Main
 # ─────────────────────────────────────────────
 async def main() -> None:
     if not all([API_ID, API_HASH, PHONE, SOURCE_CHANS, TARGET_CHAN]):
@@ -233,12 +255,9 @@ async def main() -> None:
     log.info("Max msg len : %d chars", MAX_MSG_LEN)
 
     await client.start(phone=PHONE)
-
-    # Fetch dialogs so Telethon caches all channels
     await client.get_dialogs(limit=200)
     await asyncio.sleep(2)
 
-    # Resolve every source channel explicitly
     resolved = []
     for ch in SOURCE_CHANS:
         try:
@@ -252,14 +271,12 @@ async def main() -> None:
         log.critical("No source channels resolved. Check SOURCE_CHANNELS in .env")
         return
 
-    # Register handler after login with resolved entities
     client.add_event_handler(
         handle_new_message,
         events.NewMessage(chats=resolved)
     )
 
-    log.info("🟢 Watching %d source(s). Whichever posts first wins (priority: %s).",
-             len(resolved), PRIORITY_SOURCE or "none")
+    log.info("🟢 Watching %d source(s). Priority: %s", len(resolved), PRIORITY_SOURCE or "none")
     await client.run_until_disconnected()
 
 
