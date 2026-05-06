@@ -79,22 +79,22 @@ def _fuzzy_hash(text: str) -> str:
     return hashlib.sha256(t.encode("utf-8")).hexdigest()
 
 # ─────────────────────────────────────────────
+# ─────────────────────────────────────────────
 # 3. Filter
 # ─────────────────────────────────────────────
-_TOSS_PHRASE = re.compile(r"WON\s+THE\s+TOSS\s+AND\s+(DECIDED|CHOSE|OPTED|ELECTED)\s+TO", re.IGNORECASE)
+_TOSS_PHRASE = re.compile(r"WON\s+THE\s+TOSS\s+AND\s+(DECIDED|CHOSE|OPTED?|ELECTED|CALLED)\s+TO", re.IGNORECASE)
 _DECISION    = re.compile(r"\b(BAT|BOWL)\b", re.IGNORECASE)
 _ENDING      = re.compile(r"[✔✅✓☑]")
 
 def is_toss_message(text: str) -> bool:
     if not text:
         return False
-    normalised = " ".join(text.split())
-    return bool(
-        _TOSS_PHRASE.search(normalised)
-        and _DECISION.search(normalised)
-        and _ENDING.search(text)
-    )
-
+    normalised   = " ".join(text.split())
+    has_phrase   = bool(_TOSS_PHRASE.search(normalised))
+    has_decision = bool(_DECISION.search(normalised))
+    has_tick     = bool(_ENDING.search(text))
+    has_first    = bool(re.search(r"\b(BAT|BOWL)\s+FIRST\b", normalised, re.IGNORECASE))
+    return has_phrase and has_decision and (has_tick or has_first)
 # ─────────────────────────────────────────────
 # 4. Handler (registered dynamically in main)
 # ─────────────────────────────────────────────
