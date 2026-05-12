@@ -71,7 +71,7 @@ def _toss_key(text: str) -> str | None:
         return None
     team = re.sub(r"\s+", "", match.group(1))
 
-    decision_match = re.search(r"\b(bat|bowl)\b", clean)
+    decision_match = re.search(r"\b(bat|bowl|court)\b", clean)
     if not decision_match:
         return None
 
@@ -81,10 +81,10 @@ def _toss_key(text: str) -> str | None:
 # 3. Filter
 # ─────────────────────────────────────────────
 _TOSS_PHRASE = re.compile(
-    r"WON\s+THE\s+TOSS\s+AND\s+(DECIDED|CHOSE|OPTED?|ELECTED|CALLED)\s+TO",
+    r"WON\s+THE\s+TOSS\s+(AND\s+)?(DECIDED|CHOSE|OPTED?|ELECTED|CALLED|SELECTED)\s+(TO\s+)?",
     re.IGNORECASE
 )
-_DECISION = re.compile(r"\b(BAT|BOWL)\b", re.IGNORECASE)
+_DECISION = re.compile(r"\b(BAT|BOWL|COURT)\b", re.IGNORECASE)
 _ENDING   = re.compile(r"[✔✅✓☑]")
 
 def is_toss_message(text: str) -> bool:
@@ -104,7 +104,7 @@ def is_toss_message(text: str) -> bool:
     has_phrase   = bool(_TOSS_PHRASE.search(normalised))
     has_decision = bool(_DECISION.search(normalised))
     has_tick     = bool(_ENDING.search(text))
-    has_first    = bool(re.search(r"\b(BAT|BOWL)\s+FIRST\b", normalised, re.IGNORECASE))
+    has_first    = bool(re.search(r"\b(BAT|BOWL|COURT)\b", normalised, re.IGNORECASE))
 
     return has_phrase and has_decision and (has_tick or has_first)
 
