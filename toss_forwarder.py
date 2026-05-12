@@ -91,8 +91,11 @@ def is_toss_message(text: str) -> bool:
     if not text:
         return False
 
-    if len(text.strip()) > MAX_MSG_LEN:
-        log.debug("Blocked: too long (%d chars)", len(text.strip()))
+    # Strip hidden unicode tag characters (used in subdivision flags like 🏴󠁧󠁢󠁥󠁮󠁧󠁿)
+    # before counting length — Python overcounts them badly
+    visible = re.sub(r"[\U000E0000-\U000E007F]", "", text.strip())
+    if len(visible) > MAX_MSG_LEN:
+        log.debug("Blocked: too long (%d visible chars)", len(visible))
         return False
 
     normalised = " ".join(text.split())
