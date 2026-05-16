@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import re
-import hashlib
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -21,7 +21,8 @@ TARGET_CHAN  = os.getenv("TARGET_CHANNEL", "")
 SESSION_NAME = os.getenv("SESSION_NAME", "toss_session")
 SOURCE_CHAN  = os.getenv("SOURCE_CHANNEL", "")
 
-MAX_MSG_LEN = 100
+MAX_MSG_LEN      = 100
+DEDUP_EXPIRY_SECS = 5 * 60   # 5 minutes
 
 # ─────────────────────────────────────────────
 # 1. Logging
@@ -40,24 +41,25 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
-# 2. Duplicate prevention
+# 2. Duplicate prevention (5 minute expiry)
+#    Same team winning toss again after 5 mins
+#    will be forwarded — no permanent blocking.
 # ─────────────────────────────────────────────
-_seen_keys: set[str] = set()
-SEEN_CACHE_FILE = Path("seen_hashes.txt")
 
-def _load_seen_cache() -> None:
-    if SEEN_CACHE_FILE.exists():
-        with open(SEEN_CACHE_FILE, encoding="utf-8") as f:
-            for line in f:
-                h = line.strip()
-                if h:
-                    _seen_keys.add(h)
-        log.info("Loaded %d toss keys from cache.", len(_seen_keys))
+# key → timestamp when first seen
+_seen_keys: dict[str, float] = {}
 
-def _persist_key(key: str) -> None:
-    _seen_keys.add(key)
-    with open(SEEN_CACHE_FILE, "a", encoding="utf-8") as f:
-        f.write(key + "\n")
+def _is_seen(key: str) -> bool:
+    ts = _seen_keys.get(key)
+    if ts is None:
+        return False
+    if time.time() - ts > DEDUP_EXPIRY_SECS:
+        del _seen_keys[key]   # expired — treat as new
+        return False
+    return True
+
+def _mark_seen(key: str) -> None:
+    _seen_keys[key] = time.time()
 
 def _toss_key(text: str) -> str | None:
     """Team name + decision as dedup key, all emoji/punctuation stripped."""
@@ -91,8 +93,8 @@ def is_toss_message(text: str) -> bool:
     if not text:
         return False
 
-    # Strip hidden unicode tag characters (used in subdivision flags like 🏴󠁧󠁢󠁥󠁮󠁧󠁿)
-    # before counting length — Python overcounts them badly
+    # Strip hidden unicode tag characters (subdivision flags like 🏴󠁧󠁢󠁥󠁮󠁧󠁿)
+    # before counting — Python overcounts them badly
     visible = re.sub(r"[\U000E0000-\U000E007F]", "", text.strip())
     if len(visible) > MAX_MSG_LEN:
         log.debug("Blocked: too long (%d visible chars)", len(visible))
@@ -115,7 +117,6 @@ def is_toss_message(text: str) -> bool:
 # 4. Format output — bold, clean text
 # ─────────────────────────────────────────────
 def _format_output(text: str) -> str:
-    """Strip asterisks, wrap entire message in bold HTML."""
     clean = text.strip().replace("*", "")
     clean = " ".join(clean.split())
     return f"<b>{clean}</b>"
@@ -142,11 +143,11 @@ async def handle_new_message(event: events.NewMessage.Event) -> None:
         log.debug("Could not extract toss key, skipping.")
         return
 
-    if toss_key in _seen_keys:
+    if _is_seen(toss_key):
         log.info("Duplicate skipped (key: %s).", toss_key)
         return
 
-    _persist_key(toss_key)
+    _mark_seen(toss_key)
 
     formatted = _format_output(text)
 
@@ -168,8 +169,6 @@ async def main() -> None:
         log.critical("Missing config. Need API_ID, API_HASH, PHONE, SOURCE_CHANNEL, TARGET_CHANNEL in .env")
         return
 
-    _load_seen_cache()
-
     log.info("🚀 Starting…")
     log.info("Source : %s", SOURCE_CHAN)
     log.info("Target : %s", TARGET_CHAN)
@@ -190,7 +189,7 @@ async def main() -> None:
         events.NewMessage(chats=[source_entity])
     )
 
-    log.info("🟢 Ready. Waiting for toss messages…")
+    log.info("🟢 Ready. Dedup window: %d minutes. Waiting for toss messages…", DEDUP_EXPIRY_SECS // 60)
     await client.run_until_disconnected()
 
 
